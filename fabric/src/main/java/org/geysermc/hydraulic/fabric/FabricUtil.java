@@ -30,25 +30,27 @@ public class FabricUtil {
 
     /**
      * Creates {@link ModInfo} objects for each mod in a jar, including JiJ'd mods, recursively.
-     * @see #resolveJiJ(Collection, Consumer)
+     * @see #resolveJiJ(Collection, Collection, Consumer)
      *
      * @param roots The root paths of a mod. Usually only one element, but may be more if using classpath groups.
+     * @param origin The jar(s) on disk the mod was loaded from. Inherited by its JiJ'd mods.
      * @return A stream that returns each created {@link ModInfo} object.
      */
-    public static Stream<ModInfo> resolveJiJ(Collection<Path> roots) {
-        return Stream.of(roots).mapMulti(FabricUtil::resolveJiJ);
+    public static Stream<ModInfo> resolveJiJ(Collection<Path> roots, Collection<Path> origin) {
+        return Stream.of(roots).mapMulti((r, output) -> resolveJiJ(r, origin, output));
     }
 
     /**
      * Creates {@link ModInfo} objects for each mod in a jar, including JiJ'd mods, recursively.
-     * @see #resolveJiJ(Collection)
+     * @see #resolveJiJ(Collection, Collection)
      *
      * @param roots The root paths of a mod. Usually only one element, but may be more if using classpath groups.
+     * @param origin The jar(s) on disk the mod was loaded from. Inherited by its JiJ'd mods.
      * @param output Invoked with each created {@link ModInfo} object.
      */
     // We aren't modifying jars, therefore we don't need to close() them, as they'll simply get GCed.
     @SuppressWarnings("resource")
-    public static void resolveJiJ(Collection<Path> roots, Consumer<ModInfo> output) {
+    public static void resolveJiJ(Collection<Path> roots, Collection<Path> origin, Consumer<ModInfo> output) {
         final Path fmjPath = resolveFile(roots, "fabric.mod.json");
         if (fmjPath == null) return;
 
@@ -75,7 +77,7 @@ public class FabricUtil {
         }
         if (environment instanceof JsonPrimitive && environment.getAsString().equals("server")) return;
 
-        final ModInfo modInfo = createModInfo(fmj, roots, schemaVersion);
+        final ModInfo modInfo = createModInfo(fmj, roots, origin, schemaVersion);
         if (modInfo == null) return;
         output.accept(modInfo);
 
@@ -96,12 +98,12 @@ public class FabricUtil {
             } catch (IOException ignored) {
                 continue;
             }
-            resolveJiJ(toCollection(fileSystem.getRootDirectories()), output);
+            resolveJiJ(toCollection(fileSystem.getRootDirectories()), origin, output);
         }
     }
 
     @Nullable
-    private static ModInfo createModInfo(JsonObject metadata, Collection<Path> roots, int schemaVersion) {
+    private static ModInfo createModInfo(JsonObject metadata, Collection<Path> roots, Collection<Path> origin, int schemaVersion) {
         // Fabric Loom generation checks, if generated, is not actually a mod, but a library
         final JsonElement custom = metadata.get("custom");
         boolean library = false;
@@ -179,7 +181,7 @@ public class FabricUtil {
             version.getAsString(),
             iconPath != null ? resolveFile(roots, iconPath) : null,
             roots,
-            library
+            origin
         );
     }
 
