@@ -63,7 +63,7 @@ public class HydraulicNeoForgeBootstrap implements HydraulicBootstrap {
                 mod.getVersion().toString(),
                 icon,
                 roots,
-                originOf(mod.getOwningFile().getFile())
+                false
         );
     }
 

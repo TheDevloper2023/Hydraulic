@@ -5,7 +5,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
-import net.minecraft.util.GsonHelper;
+import org.geysermc.hydraulic.Constants;
 import org.geysermc.hydraulic.fabric.platform.HydraulicFabricBootstrap;
 import org.geysermc.hydraulic.platform.mod.ModInfo;
 import org.jetbrains.annotations.Nullable;
@@ -16,9 +16,7 @@ import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Arrays;
 import java.util.Collection;
-import java.util.List;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.function.Consumer;
@@ -58,7 +56,7 @@ public class FabricUtil {
 
         final JsonObject fmj;
         try (Reader reader = Files.newBufferedReader(fmjPath)) {
-            fmj = GsonHelper.parse(reader);
+            fmj = Constants.GSON.fromJson(reader, JsonObject.class);
         } catch (IOException ignored) {
             return;
         }
@@ -108,6 +106,7 @@ public class FabricUtil {
     private static ModInfo createModInfo(JsonObject metadata, Collection<Path> roots, Collection<Path> origin, int schemaVersion) {
         // Fabric Loom generation checks, if generated, is not actually a mod, but a library
         final JsonElement custom = metadata.get("custom");
+        boolean library = false;
         if (custom instanceof JsonObject object) {
             if (
                     new JsonPrimitive(true).equals(object.get("fabric-loom:generated")) ||
@@ -115,10 +114,9 @@ public class FabricUtil {
             ) {
                 return null;
             } else if (object.get("modmenu") instanceof JsonObject modMenuData) {
+                // Libraries don't get their own pack, but other mods may still reference their assets
                 final JsonElement badges = modMenuData.get("badges");
-                if (badges instanceof JsonArray badgeArray && badgeArray.contains(new JsonPrimitive("library"))) {
-                    return null;
-                }
+                library = badges instanceof JsonArray badgeArray && badgeArray.contains(new JsonPrimitive("library"));
             }
         }
 
