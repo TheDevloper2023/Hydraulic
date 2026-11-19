@@ -33,10 +33,7 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 public class HydraulicFabricBootstrap implements HydraulicBootstrap {
-    // Minecraft's common classes would otherwise be followed into, such as Mth.cos into its lookup table.
-    private static final Set<String> NOT_MOD_JARS = Set.of("minecraft", "java", "fabricloader");
-
-    private final Supplier<Map<String, ModInfo>> modsList = Suppliers.memoize(() ->
+    private final Supplier<Map<String, ModInfo>> allModsList = Suppliers.memoize(() ->
         FabricLoader.getInstance()
             .getAllMods()
             .stream()
@@ -45,6 +42,14 @@ public class HydraulicFabricBootstrap implements HydraulicBootstrap {
             .filter(mod -> mod.getOrigin().getKind() != ModOrigin.Kind.NESTED) // Nested jars are handled in resolveJiJ below
             .<ModInfo>mapMulti((mod, output) -> FabricUtil.resolveJiJ(mod.getRootPaths(), originOf(mod), output))
             .collect(Collectors.toUnmodifiableMap(ModInfo::id, Function.identity(), this::maxByVersion))
+    );
+
+    private final Supplier<List<ModInfo>> modsList = Suppliers.memoize(() ->
+        allModsList.get()
+            .values()
+            .stream()
+            .filter(Predicate.not(ModInfo::library))
+            .toList()
     );
 
     /**
@@ -82,12 +87,17 @@ public class HydraulicFabricBootstrap implements HydraulicBootstrap {
 
     @Override
     public @Nullable ModInfo mod(@NotNull String modName) {
-        return modsList.get().get(modName);
+        return allModsList.get().get(modName);
     }
 
     @Override
     public @NotNull Collection<ModInfo> mods() {
-        return modsList.get().values();
+        return modsList.get();
+    }
+
+    @Override
+    public @NotNull Collection<ModInfo> allMods() {
+        return allModsList.get().values();
     }
 
     @Override

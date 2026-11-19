@@ -8,9 +8,9 @@ import net.minecraft.core.DefaultedRegistry;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.StringRepresentable;
-import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.block.TintedParticleLeavesBlock;
+import net.minecraft.world.level.block.LeavesBlock;
+import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.block.state.properties.BooleanProperty;
@@ -35,7 +35,6 @@ import org.geysermc.geyser.api.event.lifecycle.GeyserDefineCustomBlocksEvent;
 import org.geysermc.geyser.level.physics.PistonBehavior;
 import org.geysermc.geyser.util.MathUtils;
 import org.geysermc.hydraulic.Constants;
-import org.geysermc.hydraulic.HydraulicImpl;
 import org.geysermc.hydraulic.item.CreativeMappings;
 import org.geysermc.hydraulic.pack.PackLogListener;
 import org.geysermc.hydraulic.pack.PackModule;
@@ -44,6 +43,8 @@ import org.geysermc.hydraulic.pack.context.PackEventContext;
 import org.geysermc.hydraulic.pack.context.PackPostProcessContext;
 import org.geysermc.hydraulic.pack.context.PackPreProcessContext;
 import org.geysermc.hydraulic.storage.ModStorage;
+import org.geysermc.hydraulic.util.GeoUtil;
+import org.geysermc.hydraulic.util.ImageUtil;
 import org.geysermc.hydraulic.util.PackUtil;
 import org.geysermc.hydraulic.util.SingletonBlockGetter;
 import org.geysermc.pack.bedrock.resource.BedrockResourcePack;
@@ -57,6 +58,8 @@ import team.unnamed.creative.blockstate.MultiVariant;
 import team.unnamed.creative.blockstate.Selector;
 import team.unnamed.creative.blockstate.Variant;
 import team.unnamed.creative.metadata.animation.AnimationMeta;
+import team.unnamed.creative.model.Element;
+import team.unnamed.creative.model.ElementFace;
 import team.unnamed.creative.model.Model;
 import team.unnamed.creative.model.ModelTexture;
 import team.unnamed.creative.model.ModelTextures;
@@ -79,6 +82,8 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
 
     private final Map<String, StateDefinition> blockStates = new HashMap<>();
     private final Set<String> emptyModels = new HashSet<>();
+    private final Set<String> bakedModels = new HashSet<>();
+    private final Map<String, String> renderMethods = new HashMap<>();
 
     public BlockPackModule() {
         this.listenOn(GeyserDefineCustomBlocksEvent.class, this::onDefineCustomBlocks);
@@ -88,6 +93,19 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
     }
 
     private void preProcess(@NotNull PackPreProcessContext<BlockPackModule> context) {
+        // Track which block textures use transparency, used to pick the render method
+        Map<String, ImageUtil.Transparency> textureTransparency = new HashMap<>();
+        for (Texture texture : context.assets(ResourcePack::textures)) {
+            if (!texture.key().value().startsWith("block/")) {
+                continue;
+            }
+
+            ImageUtil.Transparency transparency = ImageUtil.transparency(texture.data());
+            if (transparency != ImageUtil.Transparency.OPAQUE) {
+                textureTransparency.put(texture.key().toString().replace(".png", ""), transparency);
+            }
+        }
+
         for (var blockState : context.assets(ResourcePack::blockStates)) {
             this.blockStates.put(blockState.key().toString(), new StateDefinition(blockState, context.modelProvider()));
         }
@@ -104,31 +122,18 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
                     continue;
                 }
 
-                Map<String, String> textures = new HashMap<>();
-                Map<String, ModelTexture> modelTextures = getTextures(stitchedModel.textures());
-                for (Map.Entry<String, ModelTexture> entry : modelTextures.entrySet()) {
-                    ModelTexture modelTexture = getModelTexture(modelTextures, entry.getKey());
-                    if (modelTexture == null || modelTexture.key() == null) {
-                        // LOGGER.warn("Could not find a texture for key {} in model {}", entry.getKey(), model.key());
-                        continue;
-                    }
-
-                    textures.put(entry.getKey(), modelTexture.key().toString());
-                }
-
-                Materials.Material material = new Materials.Material(textures);
-                materials.addMaterial(model.key().toString(), material);
+                materials.addMaterial(model.key().toString(), createMaterial(stitchedModel));
             }
 
             storage.materials(materials);
-            storage.save();
         }
 
-        // Check for empty models
+        // Check for empty models and pick each block's render method
         List<Block> blocks = context.registryValues(BuiltInRegistries.BLOCK);
         DefaultedRegistry<Block> registry = BuiltInRegistries.BLOCK;
         for (Block block : blocks) {
             Identifier blockLocation = registry.getKey(block);
+            Map<BlockState, Model> stateModels = new HashMap<>();
             for (BlockState state : block.getStateDefinition().getPossibleStates()) {
                 ModelDefinition definition = getModel(context, blockLocation, state);
                 if (definition == null) {
@@ -137,21 +142,75 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
 
                 Model model = definition.model();
                 Key key = model.key();
+                stateModels.put(state, model);
+
+                // Models from other mods or vanilla (e.g. minecraft:block/basalt) aren't covered above
+                if (storage.materials().material(key.toString()) == null) {
+                    Model stitchedModel = new ModelStitcher(context.modelProvider(), model, new PackLogListener(context.logger())).stitch();
+                    storage.materials().addMaterial(key.toString(), createMaterial(stitchedModel));
+                }
 
                 // Skip unit cube models
                 if (isUnitCube(model.parent())) {
                     continue;
                 }
 
-                // Check if the model is empty
                 Model stitchedModel = new ModelStitcher(context.modelProvider(), model, new PackLogListener(context.logger())).stitch();
+
+                // Track which uvlocked variants get baked geometry (generated in CustomModelConverter)
+                Variant variant = definition.variant();
+                if (UvLockBaker.needsBaking(variant) && UvLockBaker.canBake(stitchedModel)) {
+                    bakedModels.add(UvLockBaker.bakedKey(key, variant.x(), variant.y()).toString());
+                }
+
+                // Check if the model is empty
                 if (!stitchedModel.elements().isEmpty()) {
                     continue;
                 }
 
                 emptyModels.add(key.toString());
             }
+
+            // Bedrock needs every material instance of a block to share one render method, so pick it across all states
+            renderMethods.put(blockLocation.toString(), getRenderMethod(block, stateModels, storage.materials(), textureTransparency));
         }
+
+        storage.save();
+    }
+
+    /**
+     * Creates the material (resolved textures and tints) for a stitched model.
+     */
+    @NotNull
+    private static Materials.Material createMaterial(@NotNull Model stitchedModel) {
+        Map<String, String> textures = new HashMap<>();
+        Map<String, ModelTexture> modelTextures = getTextures(stitchedModel.textures());
+        for (Map.Entry<String, ModelTexture> entry : modelTextures.entrySet()) {
+            ModelTexture modelTexture = getModelTexture(modelTextures, entry.getKey());
+            if (modelTexture == null || modelTexture.key() == null) {
+                // LOGGER.warn("Could not find a texture for key {} in model {}", entry.getKey(), model.key());
+                continue;
+            }
+
+            textures.put(entry.getKey(), modelTexture.key().toString());
+        }
+
+        Set<String> tinted = new HashSet<>();
+        for (Element element : stitchedModel.elements()) {
+            for (ElementFace face : element.faces().values()) {
+                if (face.tintIndex() == ElementFace.DEFAULT_TINT_INDEX) {
+                    continue;
+                }
+
+                // Remove the # from the texture name if it exists
+                String texture = face.texture();
+                texture = texture.startsWith("#") ? texture.substring(1) : texture;
+
+                markTinted(modelTextures, texture, tinted);
+            }
+        }
+
+        return new Materials.Material(textures, tinted);
     }
 
     private void postProcess(@NotNull PackPostProcessContext<BlockPackModule> context) {
@@ -209,17 +268,29 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
 
             CreativeMappings.setupBlock(block, builder);
 
+            // Bedrock uses the first value of each property as the default state (which is
+            // also what the item icon renders), so put the Java default value first
+            BlockState defaultState = block.defaultBlockState();
             for (Property<?> property : block.getStateDefinition().getProperties()) {
                 if (property instanceof IntegerProperty intProperty) {
-                    builder.intProperty(property.getName(), List.copyOf(intProperty.getPossibleValues()));
+                    builder.intProperty(property.getName(), defaultFirst(intProperty, defaultState));
                 } else if (property instanceof BooleanProperty) {
                     builder.booleanProperty(property.getName());
                 } else if (property instanceof EnumProperty<?> enumProperty) {
-                    builder.stringProperty(enumProperty.getName(), enumProperty.getPossibleValues().stream().map(StringRepresentable::getSerializedName).toList());
+                    builder.stringProperty(enumProperty.getName(), defaultFirst(enumProperty, defaultState).stream()
+                            .map(StringRepresentable::getSerializedName)
+                            .toList());
                 } else {
                     throw new IllegalArgumentException("Unknown property type: " + property.getClass().getName());
                 }
             }
+
+            String renderMethod = renderMethods.getOrDefault(blockLocation.toString(), "opaque");
+            boolean fluid = block instanceof LiquidBlock;
+
+            // Calculate the base selection and collision boxes for the block
+            BoxComponent baseSelectionBox = createBoxComponent(defaultState.getShape(new SingletonBlockGetter(defaultState), BlockPos.ZERO), 0, 0, true);
+            BoxComponent baseCollisionBox = createBoxComponent(defaultState.getCollisionShape(new SingletonBlockGetter(defaultState), BlockPos.ZERO), 0, 0, false);
 
             List<CustomBlockPermutation> permutations = new ArrayList<>();
             CustomBlockComponents.Builder baseComponentBuilder = CustomBlockComponents.builder();
@@ -232,78 +303,91 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
                 Model model = definition.model();
                 Key key = model.key();
 
-                CustomBlockComponents.Builder componentsBuilder = CustomBlockComponents.builder()
-                        .transformation(new TransformationComponent(
-                            (360 - definition.variant().x()) % 360, // Rotation X
-                            (360 - definition.variant().y()) % 360, // Rotation Y
-                            0, // Rotation Z
-                            1, // Scale X
-                            1, // Scale Y
-                            1, // Scale Z
-                            0, // Translation X
-                            0, // Translation Y
-                            0 // Translation Z
-                        ));
+                // Uvlocked variants use geometry with the rotation already baked in, as rotating
+                // with the transformation would also rotate the textures. See UvLockBaker
+                Variant variant = definition.variant();
+                Key bakedKey = UvLockBaker.bakedKey(key, variant.x(), variant.y());
+                boolean baked = !isUnitCube(model.parent()) && bakedModels.contains(bakedKey.toString());
+                Key geometryKey = baked ? bakedKey : key;
+                // Bedrock rejects transforming the empty geometry (it has no bounds), and rotating it does nothing anyway
+                boolean empty = emptyModels.contains(key.toString());
+                int rotX = baked || empty ? 0 : variant.x();
+                int rotY = baked || empty ? 0 : variant.y();
 
-                if (!isUnitCube(model.parent())) {
-                    String namespace = key.namespace();
-                    String value = key.value();
+                CustomBlockComponents.Builder componentsBuilder = CustomBlockComponents.builder();
+                if (!empty) {
+                    componentsBuilder.transformation(new TransformationComponent(
+                        (360 - rotX) % 360, // Rotation X
+                        (360 - rotY) % 360, // Rotation Y
+                        0, // Rotation Z
+                        1, // Scale X
+                        1, // Scale Y
+                        1, // Scale Z
+                        0, // Translation X
+                        0, // Translation Y
+                        0 // Translation Z
+                    ));
+                }
+
+                if (fluid) {
+                    // Fluids have no block model, so use the shared geometry for the fluid height
+                    componentsBuilder.geometry(GeometryComponent.builder()
+                            .identifier(GeoUtil.fluidGeometry(state.getValue(LiquidBlock.LEVEL)))
+                            .build());
+                } else if (!isUnitCube(model.parent())) {
+                    String namespace = geometryKey.namespace();
+                    String value = geometryKey.value();
 
                     String geoKey = value.substring(value.lastIndexOf('/') + 1);
                     String geoName = "geometry." + (namespace.equals(Key.MINECRAFT_NAMESPACE) ? "" : namespace + ".") + geoKey;
 
-                    if (emptyModels.contains(key.toString())) {
-                        context.logger().warn("Missing block model for block {}", blockLocation);
-                        geoName = "geometry." + Constants.MOD_ID + ".empty";
+                    if (empty) {
+                        // Dont warn for particle-only models as they are intentionally empty
+                        if (model.parent() != null && !model.parent().asString().equals("minecraft:block/block")) {
+                            context.logger().warn("Missing block model for block {}", blockLocation);
+                        }
+                        geoName = GeoUtil.EMPTY_GEOMETRY;
                     }
 
                     componentsBuilder.geometry(GeometryComponent.builder()
                             .identifier(geoName)
                             .build());
-
-                    // TODO: This is not fully correct. On Bedrock, the shape rotates with
-                    //       the block, so the collision box will need to be rotated back here
-                    VoxelShape shape = state.getShape(new SingletonBlockGetter(state), BlockPos.ZERO);
-                    VoxelShape collisionShape = state.getCollisionShape(new SingletonBlockGetter(state), BlockPos.ZERO);
-
-                    componentsBuilder.selectionBox(createBoxComponent(shape));
-                    componentsBuilder.collisionBox(createBoxComponent(collisionShape));
                 } else {
                     componentsBuilder.geometry(GeometryComponent.builder()
                             .identifier("minecraft:geometry.full_block")
                             .build());
                 }
 
-                // TODO: Work this out based on block state/texture? as this isn't perfect
-                // https://wiki.bedrock.dev/blocks/block-components.html#render-methods
-                String renderMethod = state.canOcclude() ? "opaque" : "blend";
-
-                // If the model is a cross block (EG a flower), we need to use alpha_test_single_sided
-                if (model.parent() != null && model.parent().value().equals("block/cross")) {
-                    renderMethod = "alpha_test_single_sided";
+                // Override the base boxes if this state differs
+                BoxComponent selectionBox = createBoxComponent(state.getShape(new SingletonBlockGetter(state), BlockPos.ZERO), rotX, rotY, true);
+                BoxComponent collisionBox = createBoxComponent(state.getCollisionShape(new SingletonBlockGetter(state), BlockPos.ZERO), rotX, rotY, false);
+                if (!selectionBox.equals(baseSelectionBox)) {
+                    componentsBuilder.selectionBox(selectionBox);
+                }
+                if (!collisionBox.equals(baseCollisionBox)) {
+                    componentsBuilder.collisionBoxes(collisionBox);
                 }
 
-                String tintMethod = null;
-                // TODO Read this from the model data
-                if (block instanceof TintedParticleLeavesBlock) {
-                    tintMethod = "default_foliage";
+                // Override light emission if this state differs
+                if (state.getLightEmission() != defaultState.getLightEmission()) {
+                    componentsBuilder.lightEmission(state.getLightEmission());
                 }
+
+                // Tint colours are registered client side, so guess based on the block type
+                String tintMethod = block instanceof LeavesBlock ? "default_foliage" : "grass";
 
                 Materials materials = context.storage().materials();
                 Materials.Material material = materials.material(key.toString());
-                if (material != null) {
+
+                if (fluid && material != null && !material.textures().isEmpty()) {
+                    addFluidMaterials(componentsBuilder, material, renderMethod, model);
+                } else if (material != null && !material.textures().isEmpty()) {
                     // Add a default texture, can be replaced by the below (I think)
                     Map.Entry<String, String> firstEntry = material.textures().entrySet().iterator().next();
 
                     String name = PackUtil.getTextureName(firstEntry.getValue());
 
-                    componentsBuilder.materialInstance("*", MaterialInstance.builder()
-                            .texture(name)
-                            .renderMethod(renderMethod)
-                            .faceDimming(true)
-                            .ambientOcclusion(model.ambientOcclusion())
-                            .tintMethod(tintMethod)
-                            .build());
+                    componentsBuilder.materialInstance("*", createMaterialInstance(name, renderMethod, model, material.tinted(firstEntry.getKey()) ? tintMethod : null));
 
                     Map<String, String> faceMapping = getFaceMapping(model.parent());
                     if (!faceMapping.isEmpty()) {
@@ -312,13 +396,7 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
 
                             String textureName = PackUtil.getTextureName(material.textures().get(face.getValue()));
 
-                            componentsBuilder.materialInstance(face.getKey(), MaterialInstance.builder()
-                                    .texture(textureName)
-                                    .renderMethod(renderMethod)
-                                    .faceDimming(true)
-                                    .ambientOcclusion(model.ambientOcclusion())
-                                    .tintMethod(tintMethod)
-                                    .build());
+                            componentsBuilder.materialInstance(face.getKey(), createMaterialInstance(textureName, renderMethod, model, material.tinted(face.getValue()) ? tintMethod : null));
                         }
                     } else {
                         for (Map.Entry<String, String> entry : material.textures().entrySet()) {
@@ -329,23 +407,11 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
                                 materialKey = "*";
                             }
 
-                            componentsBuilder.materialInstance(materialKey, MaterialInstance.builder()
-                                    .texture(PackUtil.getTextureName(entry.getValue()))
-                                    .renderMethod(renderMethod)
-                                    .faceDimming(true)
-                                    .ambientOcclusion(model.ambientOcclusion())
-                                    .tintMethod(tintMethod)
-                                    .build());
+                            componentsBuilder.materialInstance(materialKey, createMaterialInstance(PackUtil.getTextureName(entry.getValue()), renderMethod, model, material.tinted(entry.getKey()) ? tintMethod : null));
                         }
                     }
                 } else {
-                    componentsBuilder.materialInstance("*", MaterialInstance.builder()
-                            .texture(PackUtil.getTextureName(key.toString()))
-                            .renderMethod(renderMethod)
-                            .faceDimming(true)
-                            .ambientOcclusion(model.ambientOcclusion())
-                            .tintMethod(tintMethod)
-                            .build());
+                    componentsBuilder.materialInstance("*", createMaterialInstance(PackUtil.getTextureName(key.toString()), renderMethod, model, null));
                     context.logger().warn("Could not find material for block {}", key);
                 }
 
@@ -374,17 +440,14 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
 
             builder.permutations(permutations);
 
-            BlockState defaultState = block.defaultBlockState();
-            VoxelShape shape = defaultState.getShape(new SingletonBlockGetter(defaultState), BlockPos.ZERO);
-            VoxelShape collisionShape = defaultState.getCollisionShape(new SingletonBlockGetter(defaultState), BlockPos.ZERO);
-
             CustomBlockComponents.Builder componentsBuilder = baseComponentBuilder
                     .displayName("%" + block.getDescriptionId())
                     .friction(Math.min(1 - block.getFriction(), 0.9f))
+                    .lightDampening(defaultState.getLightDampening())
+                    .lightEmission(defaultState.getLightEmission())
                     .destructibleByMining(block.defaultDestroyTime() < 0 ? UNBREAKABLE_DESTROY_TIME : block.defaultDestroyTime()) // TODO: Check
-                    // .unitCube(true) // TODO: Geometry conversion
-                    .selectionBox(createBoxComponent(shape))
-                    .collisionBox(createBoxComponent(collisionShape));
+                    .selectionBox(baseSelectionBox)
+                    .collisionBoxes(baseCollisionBox);
 
             builder.components(componentsBuilder.build());
 
@@ -428,19 +491,6 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
                         .waterlogged(state.hasProperty(BlockStateProperties.WATERLOGGED) && state.getValue(BlockStateProperties.WATERLOGGED))
                         .stateGroupId(blockId)
                         .pistonBehavior(pistonBehavior.name());
-
-                // TODO Work out if we need to prefix with _item so we can remove InventoryUtilsMixin
-                try {
-                    ItemStack pickItem = state.getCloneItemStack(HydraulicImpl.instance().server().overworld(), BlockPos.ZERO, false);
-                    String itemId = BuiltInRegistries.ITEM.getKey(pickItem.getItem()).toString();
-
-                    // If the method is annotated with `@Environment(EnvType.CLIENT)` then we get air back, so lets ignore that
-                    if (!itemId.equals("minecraft:air")) {
-                        javaBlockStateBuilder.pickItem(itemId);
-                    }
-                } catch (Exception e) {
-                    context.logger().warn("Failed to get pick item for block {}: {}", blockLocation, e.getMessage());
-                }
 
                 /*
                 List<AABB> aabbs = collisionShape.toAabbs();
@@ -588,6 +638,102 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
         return null;
     }
 
+    /**
+     * Gets the Bedrock render method for a block from the most transparent texture across all of its states.
+     * <p>
+     * Bedrock requires every material instance of a block to use the same render method,
+     * including across permutations, so this is worked out once per block.
+     * @see <a href="https://wiki.bedrock.dev/blocks/block-visuals-intro#render-methods">Render methods</a>
+     *
+     * @param block the block
+     * @param stateModels the model for each block state
+     * @param materials the materials to look up each model's textures in
+     * @param textureTransparency the transparency of each non-opaque block texture
+     * @return the render method
+     */
+    private static String getRenderMethod(@NotNull Block block, @NotNull Map<BlockState, Model> stateModels, @NotNull Materials materials, @NotNull Map<String, ImageUtil.Transparency> textureTransparency) {
+        ImageUtil.Transparency transparency = ImageUtil.Transparency.OPAQUE;
+        boolean occludes = true;
+        boolean cross = false;
+
+        for (Map.Entry<BlockState, Model> entry : stateModels.entrySet()) {
+            // Distance-based methods draw every state opaque far away, so only use them if every state occludes
+            occludes &= entry.getKey().canOcclude();
+
+            Model model = entry.getValue();
+            String parent = model.parent() == null ? null : model.parent().value();
+            cross |= "block/cross".equals(parent) || "block/tinted_cross".equals(parent);
+
+            Materials.Material material = materials.material(model.key().toString());
+            if (material == null) {
+                continue;
+            }
+
+            for (String texture : material.textures().values()) {
+                ImageUtil.Transparency textureValue = textureTransparency.getOrDefault(texture, ImageUtil.Transparency.OPAQUE);
+                if (textureValue.compareTo(transparency) > 0) {
+                    transparency = textureValue;
+                }
+            }
+        }
+
+        if (transparency == ImageUtil.Transparency.TRANSLUCENT) {
+            return "blend";
+        }
+
+        if (block instanceof LeavesBlock) {
+            return "alpha_test_to_opaque";
+        }
+
+        if (transparency == ImageUtil.Transparency.CUTOUT) {
+            return occludes ? "alpha_test_single_sided_to_opaque" : "alpha_test_single_sided"; // E.g. overlays, or plants and doors
+        }
+
+        return cross ? "alpha_test_single_sided" : "opaque";
+    }
+
+    /**
+     * Add the material instances for a fluid block
+     * <p>
+     * Fluid textures are registered client side, so guess them from the particle texture.
+     *
+     * @param componentsBuilder the components builder to add the material instances to
+     * @param material the fluid block model's material
+     * @param renderMethod the render method of the block
+     * @param model the fluid block model
+     */
+    private static void addFluidMaterials(@NotNull CustomBlockComponents.Builder componentsBuilder, @NotNull Materials.Material material, @NotNull String renderMethod, @NotNull Model model) {
+        String still = material.textures().getOrDefault("particle", material.textures().values().iterator().next());
+        String flow = still.endsWith("_still") ? still.substring(0, still.length() - 6) + "_flow" : still;
+
+        String stillName = PackUtil.getTextureName(still);
+        componentsBuilder.materialInstance("*", createMaterialInstance(PackUtil.getTextureName(flow), renderMethod, model, null));
+        componentsBuilder.materialInstance("up", createMaterialInstance(stillName, renderMethod, model, null));
+        componentsBuilder.materialInstance("down", createMaterialInstance(stillName, renderMethod, model, null));
+    }
+
+    private static MaterialInstance createMaterialInstance(@NotNull String texture, @NotNull String renderMethod, @NotNull Model model, @Nullable String tintMethod) {
+        return MaterialInstance.builder()
+                .texture(texture)
+                .renderMethod(renderMethod)
+                .faceDimming(true)
+                .ambientOcclusionExponent(model.ambientOcclusion() ? 1.0f : 0.0f)
+                .tintMethod(tintMethod)
+                .build();
+    }
+
+    private static void markTinted(@NotNull Map<String, ModelTexture> textures, @NotNull String key, @NotNull Set<String> tinted) {
+        if (!tinted.add(key)) {
+            return;
+        }
+
+        // Texture references the value of another texture
+        ModelTexture value = textures.get(key);
+        if (value != null && value.reference() != null) {
+            markTinted(textures, value.reference(), tinted);
+        }
+    }
+
     @Nullable
     private static ModelTexture getModelTexture(@NotNull Map<String, ModelTexture> textures, @NotNull String key) {
         return getModelTexture(textures, key, new HashSet<>());
@@ -673,7 +819,18 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
         return mapping;
     }
 
-    private static BoxComponent createBoxComponent(VoxelShape shape) {
+    /**
+     * Creates a box component from a Java shape, undoing the given variant rotation
+     * since Bedrock re-applies it through the transformation component.
+     *
+     * @param shape the Java world-space shape
+     * @param rotX the variant X rotation in degrees
+     * @param rotY the variant Y rotation in degrees
+     * @param selection whether this is a selection box. Selection boxes need the X axis mirrored and must
+     *                  stay within the block, while collision boxes can go up to 1.5 blocks tall (e.g. walls)
+     * @return the box component
+     */
+    private static BoxComponent createBoxComponent(VoxelShape shape, int rotX, int rotY, boolean selection) {
         if (shape.isEmpty()) {
             return BoxComponent.emptyBox();
         }
@@ -684,7 +841,8 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
         float maxX = -5;
         float maxY = -5;
         float maxZ = -5;
-        for (AABB boundingBox : shape.toAabbs()) {
+        for (AABB worldBox : shape.toAabbs()) {
+            AABB boundingBox = unrotate(worldBox, rotX, rotY);
             double offsetX = boundingBox.getXsize() * 0.5;
             double offsetY = boundingBox.getYsize() * 0.5;
             double offsetZ = boundingBox.getZsize() * 0.5;
@@ -703,16 +861,44 @@ public class BlockPackModule extends PackModule<BlockPackModule> {
         minY = MathUtils.clamp(minY, 0, 1);
         minZ = MathUtils.clamp(minZ, 0, 1);
         maxX = MathUtils.clamp(maxX, 0, 1);
-        maxY = MathUtils.clamp(maxY, 0, 1);
+        maxY = MathUtils.clamp(maxY, 0, selection ? 1 : 1.5f);
         maxZ = MathUtils.clamp(maxZ, 0, 1);
 
         return new BoxComponent(
-                16 * (1 - maxX) - 8, // For some odd reason X is mirrored on Bedrock
+                16 * (selection ? 1 - maxX : minX) - 8,
                 16 * minY,
                 16 * minZ - 8,
                 16 * (maxX - minX),
                 16 * (maxY - minY),
                 16 * (maxZ - minZ)
         );
+    }
+
+    private static <T extends Comparable<T>> List<T> defaultFirst(Property<T> property, BlockState state) {
+        T defaultValue = state.getValue(property);
+        List<T> values = new ArrayList<>(property.getPossibleValues());
+        values.remove(defaultValue);
+        values.addFirst(defaultValue);
+        return values;
+    }
+
+    /**
+     * Applies the inverse of a Java blockstate variant rotation to a box.
+     * Java applies X then Y, so we undo Y first, then X.
+     */
+    private static AABB unrotate(AABB box, int rotX, int rotY) {
+        int yTurns = Math.floorMod(rotY / 90, 4);
+        for (int i = 0; i < yTurns; i++) {
+            // Inverse of Java's Y+90 (x, z) -> (1 - z, x)
+            box = new AABB(box.minZ, box.minY, 1 - box.maxX, box.maxZ, box.maxY, 1 - box.minX);
+        }
+
+        int xTurns = Math.floorMod(rotX / 90, 4);
+        for (int i = 0; i < xTurns; i++) {
+            // Inverse of Java's X+90 (y, z) -> (z, 1 - y)
+            box = new AABB(box.minX, 1 - box.maxZ, box.minY, box.maxX, 1 - box.minZ, box.maxY);
+        }
+
+        return box;
     }
 }

@@ -14,6 +14,12 @@
     "ext.MinecraftResourcePackReaderImplMixin",
     "ext.MinecraftTypesMixin",
     "ext.ModelSerializerMixin"
+    "creative.BlockStateSerializerMixin",
+    "geyser.ItemTranslatorMixin",
+    "geyser.MinecraftTypesMixin",
+    "creative.MinecraftResourcePackReaderImplMixin",
+    "creative.ModelSerializerMixin",
+    "converter.VanillaPackProviderMixin"
   ],
   "injectors": {
     "defaultRequire": 1

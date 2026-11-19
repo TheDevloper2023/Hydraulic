@@ -3,10 +3,11 @@ package org.geysermc.hydraulic.item;
 import com.google.auto.service.AutoService;
 import net.kyori.adventure.key.Key;
 import net.minecraft.core.DefaultedRegistry;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.locale.Language;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.item.*;
-import net.minecraft.world.item.Item;
 import net.minecraft.world.level.block.Block;
 import org.geysermc.geyser.api.event.lifecycle.GeyserDefineCustomItemsEvent;
 import org.geysermc.geyser.api.item.custom.v2.CustomItemBedrockOptions;
@@ -14,15 +15,16 @@ import org.geysermc.geyser.api.item.custom.v2.NonVanillaCustomItemDefinition;
 import org.geysermc.geyser.api.item.custom.v2.component.geyser.GeyserBlockPlacer;
 import org.geysermc.geyser.api.item.custom.v2.component.geyser.GeyserChargeable;
 import org.geysermc.geyser.api.item.custom.v2.component.geyser.GeyserItemDataComponents;
+import org.geysermc.hydraulic.component.ComponentConverter;
+import org.geysermc.hydraulic.entity.vanilla.VanillaModels;
 import org.geysermc.hydraulic.pack.PackLogListener;
 import org.geysermc.hydraulic.pack.PackModule;
 import org.geysermc.hydraulic.pack.TexturePackModule;
 import org.geysermc.hydraulic.pack.context.PackEventContext;
 import org.geysermc.hydraulic.pack.context.PackPostProcessContext;
 import org.geysermc.hydraulic.pack.context.PackPreProcessContext;
-import org.geysermc.hydraulic.component.ComponentConverter;
-import org.geysermc.hydraulic.entity.vanilla.VanillaModels;
 import org.geysermc.hydraulic.util.HydraulicKey;
+import org.geysermc.hydraulic.util.ImageUtil;
 import org.geysermc.hydraulic.util.PackUtil;
 import org.geysermc.pack.bedrock.resource.BedrockResourcePack;
 import org.geysermc.pack.converter.type.model.ModelStitcher;
@@ -31,11 +33,13 @@ import org.jetbrains.annotations.Nullable;
 import team.unnamed.creative.ResourcePack;
 import team.unnamed.creative.item.*;
 import team.unnamed.creative.item.tint.ConstantTintSource;
+import team.unnamed.creative.item.tint.GrassTintSource;
 import team.unnamed.creative.item.tint.TintSource;
 import team.unnamed.creative.model.Model;
 import team.unnamed.creative.model.ModelTexture;
 import team.unnamed.creative.texture.Texture;
 
+import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.util.*;
 
@@ -46,6 +50,7 @@ public class ItemPackModule extends TexturePackModule<ItemPackModule> {
     private final Map<String, String> itemBuiltinTexture = new HashMap<>();
     private final Map<String, List<Integer>> itemTints = new HashMap<>();
     private final Set<String> bakedIcons = new HashSet<>();
+    private BufferedImage grassColormap;
 
     public ItemPackModule() {
         this.listenOn(GeyserDefineCustomItemsEvent.class, this::onDefineCustomItems);
@@ -56,20 +61,30 @@ public class ItemPackModule extends TexturePackModule<ItemPackModule> {
 
     private void handleModel(@NotNull PackPreProcessContext<ItemPackModule> context, ItemModel itemModel, Identifier itemLocation) {
         if (itemModel instanceof ReferenceItemModel referenceModel) {
+            String itemKey = itemLocation.toString();
+
+            // Bedrock can't tint item icons dynamically, so tints are baked into the icon instead
+            if (!referenceModel.tints().isEmpty()) {
+                TintSource firstTint = referenceModel.tints().getFirst();
+                if (firstTint instanceof ConstantTintSource constantTint) {
+                    List<Integer> tints = new ArrayList<>();
+                    for (TintSource tint : referenceModel.tints()) {
+                        tints.add(tint instanceof ConstantTintSource constant ? constant.tint() & 0xFFFFFF : null);
+                    }
+                    this.itemTints.put(itemKey, tints);
+                } else if (firstTint instanceof GrassTintSource grassTint) {
+                    Integer grassColor = grassColor(context, grassTint.temperature(), grassTint.downfall());
+                    if (grassColor != null) {
+                        this.itemTints.put(itemKey, List.of(grassColor & 0xFFFFFF));
+                    }
+                }
+            }
+
             Key modelKey = referenceModel.model();
             Model model = context.modelProvider().model(modelKey);
             if (model == null) {
                 context.logger().debug("Could not resolve model {} for item {}", modelKey, itemLocation);
                 return;
-            }
-
-            // Bedrock icons can't be tinted, so constant tints are baked into the icon instead.
-            if (referenceModel.tints().stream().anyMatch(ConstantTintSource.class::isInstance)) {
-                List<Integer> tints = new ArrayList<>();
-                for (TintSource tint : referenceModel.tints()) {
-                    tints.add(tint instanceof ConstantTintSource constant ? constant.tint() & 0xFFFFFF : null);
-                }
-                this.itemTints.put(itemLocation.toString(), tints);
             }
 
             // Build the list of all parents in the model chain
@@ -93,6 +108,31 @@ public class ItemPackModule extends TexturePackModule<ItemPackModule> {
         } else if (itemModel instanceof RangeDispatchItemModel rangeDispatchModel) {
             handleModel(context, rangeDispatchModel.fallback(), itemLocation);
         }
+    }
+
+    /**
+     * Gets the grass colour for the given climate from the vanilla grass colormap, the same way Java does.
+     *
+     * @param context the pre-process context
+     * @param temperature the temperature
+     * @param downfall the downfall
+     * @return the grass colour in RGB, or null if the colormap couldn't be read
+     */
+    @Nullable
+    private Integer grassColor(@NotNull PackPreProcessContext<ItemPackModule> context, float temperature, float downfall) {
+        if (grassColormap == null) {
+            Texture texture = context.vanillaPack().texture(Key.key("colormap/grass.png"));
+            grassColormap = texture == null ? null : ImageUtil.read(texture.data());
+            if (grassColormap == null) {
+                return null;
+            }
+        }
+
+        temperature = Math.clamp(temperature, 0, 1);
+        downfall = Math.clamp(downfall, 0, 1) * temperature;
+        int x = (int) ((1 - temperature) * 255);
+        int y = (int) ((1 - downfall) * 255);
+        return grassColormap.getRGB(x, y) & 0xFFFFFF;
     }
 
     private void preProcess(@NotNull PackPreProcessContext<ItemPackModule> context) {
@@ -146,7 +186,9 @@ public class ItemPackModule extends TexturePackModule<ItemPackModule> {
 
             Model baseModel = assets.model(Key.key(itemLocation.getNamespace(), "item/" + itemLocation.getPath()));
             if (baseModel == null) {
-                context.logger().warn("Item {} has no item model, skipping", itemLocation);
+                if (!(item instanceof BlockItem)) {
+                    context.logger().warn("Item {} has no item model, skipping", itemLocation);
+                }
                 continue;
             }
 
@@ -300,6 +342,14 @@ public class ItemPackModule extends TexturePackModule<ItemPackModule> {
                     );
 
                     CreativeMappings.setupBlock(block, customItemOptions);
+                }
+
+                // Put the song name onto a second line of the name like Bedrock does
+                JukeboxPlayable playable = item.components().get(DataComponents.JUKEBOX_PLAYABLE);
+                if (playable != null && playable.song().isBound()) {
+                    customItemDefinition.displayName(item.components().getOrDefault(DataComponents.RARITY, Rarity.COMMON).color()
+                            + Language.getInstance().getOrDefault(item.getDescriptionId())
+                            + "\n§7" + playable.song().value().description().getString() + "§f");
                 }
 
                 customItemDefinition.bedrockOptions(customItemOptions);

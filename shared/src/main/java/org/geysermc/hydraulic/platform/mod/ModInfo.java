@@ -23,6 +23,7 @@ public record ModInfo(
     @Nullable Path iconPath,
     @NotNull Collection<Path> roots,
     @NotNull Collection<Path> origin
+    boolean library
 ) {
     @Nullable
     public Path resolveFile(String file) {
